@@ -1,0 +1,6 @@
+{
+  "name": "Solar Weather Card",
+  "description": "A Home Assistant card combining a live clock, multi-day weather forecast, solar power bar, solar day arc and optional rain radar.",
+  "render_readme": true,
+  "homeassistant": "2023.9.0"
+}

@@ -123,10 +123,10 @@ class SolarWeatherCardEditor extends HTMLElement {
       {
         id: 'weather', title: '🌤️ Weather & Forecast', defaultOpen: true,
         fields: [
-          { key: 'weather_entity',      label: 'Weather entity',           selector: { entity: { domain: 'weather' } } },
-          { key: 'show_weather_section', label: 'Show weather section',     selector: { boolean: {} } },
-          { key: 'show_forecast_days',   label: 'Show forecast day bars',   selector: { boolean: {} } },
-          { key: 'forecast_days',        label: 'Default forecast days (1–7)', selector: { number: { min: 1, max: 7, step: 1, mode: 'slider' } } },
+          { key: 'weather_entity',       label: 'Weather entity',              selector: { entity: { domain: 'weather' } } },
+          { key: 'show_weather_section', label: 'Show weather section',         selector: { boolean: {} } },
+          { key: 'show_forecast_days',   label: 'Show forecast day bars',       selector: { boolean: {} } },
+          { key: 'forecast_days',        label: 'Default forecast days (1–7)',  selector: { number: { min: 1, max: 7, step: 1, mode: 'slider' } } },
         ],
       },
       {
@@ -139,7 +139,7 @@ class SolarWeatherCardEditor extends HTMLElement {
           { key: 'inverter_size',           label: 'Inverter size (kW)',          selector: { number: { min: 1, max: 100, step: 0.5, mode: 'box', unit_of_measurement: 'kW' } } },
           { key: 'show_solar_section',      label: 'Show solar bar',              selector: { boolean: {} } },
           { key: 'show_solar_arc',          label: 'Show day progress bar',       selector: { boolean: {} } },
-          { key: 'show_stats',              label: 'Show stat tiles',             selector: { boolean: {} } },
+          { key: 'show_stats',              label: 'Show stat row (Export/Import/Usage)', selector: { boolean: {} } },
           { key: 'show_bar_values',         label: 'Show kW value on bar',        selector: { boolean: {} } },
         ],
       },
@@ -158,7 +158,6 @@ class SolarWeatherCardEditor extends HTMLElement {
         id: 'display', title: '🎨 Display', defaultOpen: false,
         fields: [
           { key: 'color_palette', label: 'Colour palette', selector: { select: { options: palettes } } },
-          { key: 'show_legend',   label: 'Show legend',    selector: { boolean: {} } },
         ],
       },
     ];
@@ -230,7 +229,8 @@ class SolarWeatherCard extends HTMLElement {
     this._forecastUnsub     = null;
     this._weatherForecast   = [];
     this._lastWeatherEntity = null;
-    // Radar iframe cache — same element is re-appended so the map survives re-renders
+    // Radar iframe — lives in a stable container that is NEVER destroyed
+    // by innerHTML updates, preventing the reload-on-reattach flicker.
     this._radarIframe       = null;
     this._radarIframeKey    = null;
   }
@@ -254,7 +254,6 @@ class SolarWeatherCard extends HTMLElement {
       show_solar_section:      true,
       show_solar_arc:          true,
       show_stats:              true,
-      show_legend:             true,
       show_bar_values:         true,
       show_radar:              false,
       radar_rain_threshold:    0.5,
@@ -287,7 +286,7 @@ class SolarWeatherCard extends HTMLElement {
     this._unsubForecast();
   }
 
-  // ── Forecast subscription (HA 2023.9+ weather/subscribe_forecast WS API) ──
+  // ── Forecast subscription ─────────────────────────────────────────────────
 
   async _subscribeForecast() {
     this._unsubForecast();
@@ -296,14 +295,10 @@ class SolarWeatherCard extends HTMLElement {
     this._lastWeatherEntity = entity;
     try {
       this._forecastUnsub = await this._hass.connection.subscribeMessage(
-        (msg) => {
-          this._weatherForecast = msg.forecast || [];
-          this._render();
-        },
+        (msg) => { this._weatherForecast = msg.forecast || []; this._render(); },
         { type: 'weather/subscribe_forecast', forecast_type: 'daily', entity_id: entity }
       );
     } catch (_) {
-      // Fallback for older HA or integrations still using attributes
       const wx = this._hass.states[entity];
       this._weatherForecast = wx?.attributes?.forecast || [];
       this._render();
@@ -325,6 +320,108 @@ class SolarWeatherCard extends HTMLElement {
     return fc && fc[0] ? parseFloat(fc[0].precipitation || 0) : 0;
   }
 
+  // ── Shell management ──────────────────────────────────────────────────────
+  // The shadow root is split into:
+  //   <style id="swc-style">   — updated via textContent (no DOM destroy)
+  //   <ha-card>
+  //     <div id="swc-dyn">    — updated via innerHTML (card content, no radar body)
+  //     <div id="swc-radar-stable">  — radar iframe lives here; NEVER touched by innerHTML
+  //
+  // This ensures the sandboxed iframe is never detached from the DOM, preventing
+  // the browser from reloading it on every clock tick / hass state update.
+
+  _ensureShell() {
+    if (this.shadowRoot.getElementById('swc-dyn')) return; // shell already exists
+    this.shadowRoot.innerHTML = `
+      <style id="swc-style"></style>
+      <ha-card class="swc-card">
+        <div id="swc-dyn"></div>
+        <div id="swc-radar-stable" style="display:none;"></div>
+      </ha-card>
+    `;
+  }
+
+  // ── CSS (palette-dependent, updated via textContent) ──────────────────────
+
+  _css(colors) {
+    return `
+      :host { display: block; }
+      .swc-card {
+        background: var(--ha-card-background, var(--card-background-color, #fff));
+        border-radius: var(--ha-card-border-radius, 12px);
+        border: 0.5px solid var(--divider-color, rgba(0,0,0,0.12));
+        padding: 0; overflow: hidden;
+        font-family: var(--primary-font-family, sans-serif);
+        color: var(--primary-text-color);
+      }
+      .swc-inner { padding: 16px 20px 14px; }
+
+      /* Clock */
+      .swc-header { display: flex; align-items: flex-start; justify-content: space-between; }
+      .swc-time { font-size: 52px; font-weight: 300; line-height: 1; letter-spacing: -2px; }
+      .swc-date { font-size: 13px; color: var(--secondary-text-color); margin-top: 5px; }
+      .swc-weather-col { text-align: right; }
+      .swc-wx-icon { font-size: 32px; line-height: 1; }
+      .swc-wx-temp { font-size: 24px; font-weight: 300; margin-top: 2px; }
+      .swc-wx-desc { font-size: 11px; color: var(--secondary-text-color); margin-top: 2px; }
+
+      /* Divider */
+      .swc-divider { height: 1px; background: var(--divider-color, rgba(0,0,0,0.08)); margin: 0 16px; }
+
+      /* Forecast */
+      .swc-forecast-wrap { padding: 10px 20px 12px; }
+      .swc-fc-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+      .swc-fc-title { font-size: 11px; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; color: var(--secondary-text-color); }
+      .swc-expand-btn { font-size: 11px; cursor: pointer; color: var(--accent-color, #03a9f4); }
+      .swc-day-row { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+      .swc-day-name { font-size: 12px; width: 32px; flex-shrink: 0; color: var(--secondary-text-color); }
+      .swc-day-icon { width: 18px; flex-shrink: 0; font-size: 14px; text-align: center; }
+      .swc-temp-lo { font-size: 11px; color: var(--secondary-text-color); width: 26px; text-align: right; flex-shrink: 0; }
+      .swc-temp-hi { font-size: 12px; font-weight: 600; width: 26px; flex-shrink: 0; }
+      .swc-temp-track { flex: 1; height: 8px; background: var(--secondary-background-color, rgba(0,0,0,0.06)); border-radius: 4px; position: relative; overflow: hidden; }
+      .swc-temp-fill { height: 8px; border-radius: 4px; position: absolute; }
+
+      /* Solar */
+      .swc-solar-wrap { padding: 10px 20px 14px; }
+      .swc-solar-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+      .swc-solar-label { font-size: 11px; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; color: var(--secondary-text-color); }
+      .swc-solar-kw { font-size: 22px; font-weight: 300; }
+      .swc-solar-kw-unit { font-size: 13px; color: var(--secondary-text-color); }
+      .swc-standby { font-size: 12px; color: var(--secondary-text-color); padding: 4px 0 2px; }
+      .swc-pwr-bar { height: 34px; border-radius: 8px; background: var(--secondary-background-color, rgba(0,0,0,0.06)); position: relative; overflow: hidden; }
+      .swc-pwr-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 8px; display: flex; align-items: center; justify-content: flex-end; padding-right: 10px; background: ${colors.solar}; }
+      .swc-pwr-val { font-size: 11px; font-weight: 600; color: rgba(0,0,0,0.65); white-space: nowrap; }
+      .swc-stat-row { display: flex; gap: 16px; margin-top: 8px; font-size: 12px; }
+      .swc-stat-item { display: flex; align-items: center; gap: 4px; }
+      .swc-stat-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+      .swc-stat-lbl { color: var(--secondary-text-color); }
+      .swc-stat-val { font-weight: 500; }
+
+      /* Day progress bar */
+      .swc-daybar-wrap { padding: 6px 20px 14px; }
+      .swc-daybar-label { font-size: 11px; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; color: var(--secondary-text-color); margin-bottom: 10px; }
+      .swc-daybar-track { position: relative; height: 5px; background: var(--secondary-background-color, rgba(0,0,0,0.08)); border-radius: 3px; margin: 14px 0 16px; }
+      .swc-daybar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: ${colors.solar}; opacity: 0.7; }
+      .swc-daybar-sun { position: absolute; top: 50%; transform: translate(-50%,-50%); font-size: 18px; line-height: 1; pointer-events: none; }
+      .swc-daybar-times { display: flex; justify-content: space-between; font-size: 11px; color: var(--secondary-text-color); }
+
+      /* Radar header (body lives in swc-radar-stable) */
+      .swc-radar-wrap { padding: 0 20px 14px; }
+      .swc-radar-header { display: flex; align-items: center; justify-content: space-between; background: var(--secondary-background-color, rgba(0,0,0,0.04)); border-radius: 8px; padding: 9px 14px; cursor: pointer; user-select: none; }
+      .swc-radar-title { font-size: 13px; font-weight: 500; }
+      .swc-radar-badge { font-size: 11px; padding: 2px 8px; border-radius: 8px; background: var(--error-color, #f44336); color: #fff; margin-left: 8px; }
+      .swc-radar-chevron { font-size: 14px; color: var(--secondary-text-color); transition: transform 0.2s; }
+      .swc-radar-chevron.open { transform: rotate(90deg); }
+
+      /* Radar stable body */
+      .swc-radar-body-wrap { padding: 0 20px 14px; }
+      .swc-radar-note { font-size: 11px; color: var(--secondary-text-color); padding: 14px; text-align: center; background: var(--secondary-background-color, rgba(0,0,0,0.03)); border-radius: 8px; }
+
+      /* Rain pill */
+      .swc-rain-pill { display: inline-block; background: var(--info-color, #2196f3); color: #fff; font-size: 10px; border-radius: 8px; padding: 1px 7px; margin-left: 8px; vertical-align: middle; }
+    `;
+  }
+
   // ── Render ────────────────────────────────────────────────────────────────
 
   _render() {
@@ -333,20 +430,25 @@ class SolarWeatherCard extends HTMLElement {
     const palette = getPalette(this._config.color_palette);
     const colors  = palette.colors;
 
-    // Clock
+    // Ensure stable shell exists (created once, never destroyed)
+    this._ensureShell();
+
+    // Update palette-dependent CSS without touching the DOM structure
+    const styleEl = this.shadowRoot.getElementById('swc-style');
+    if (styleEl) styleEl.textContent = this._css(colors);
+
+    // ── Computed values ───────────────────────────────────────────────────
+
     const now     = new Date();
     const timeStr = formatTime(now, this._config.time_format === '24h');
     const dateStr = formatDate(now, this._config.date_format);
 
-    // Weather current
     const wxEnt   = this._getState(this._config.weather_entity);
     const wxState = wxEnt?.state || '';
-    const wxIcon  = weatherIcon(wxState);
     const wxTemp  = safeNum(wxEnt?.attributes.temperature);
     const wxUnit  = wxEnt?.attributes.temperature_unit || '°C';
     const wxDesc  = wxState.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
 
-    // Solar
     const inverter  = parseFloat(this._config.inverter_size) || 10;
     const solar     = parseKw(this._getState(this._config.production_entity));
     const usage     = parseKw(this._getState(this._config.self_consumption_entity));
@@ -355,13 +457,11 @@ class SolarWeatherCard extends HTMLElement {
     const isStandby = solar < 0.01;
     const solarPct  = clamp((solar / inverter) * 100, 0, 100);
 
-    // Precipitation / radar
     const precip    = this._getPrecipitation();
     const threshold = parseFloat(this._config.radar_rain_threshold) || 0.5;
     const rainAlert = precip >= threshold;
     if (rainAlert && this._config.show_radar) this._radarExpanded = true;
 
-    // Forecast rows
     const forecastDays  = parseInt(this._config.forecast_days) || 3;
     const fc            = this._weatherForecast || [];
     const displayDays   = this._forecastExpanded
@@ -371,7 +471,6 @@ class SolarWeatherCard extends HTMLElement {
     const canExpand     = !this._forecastExpanded && fc.length > displayDays && displayDays < 7;
     const canCollapse   = this._forecastExpanded && forecastDays < 7;
 
-    // Sun arc
     const sunObj  = this._hass?.states['sun.sun'];
     const sunrise = sunObj?.attributes.next_rising  ? new Date(sunObj.attributes.next_rising)  : null;
     const sunset  = sunObj?.attributes.next_setting ? new Date(sunObj.attributes.next_setting) : null;
@@ -380,120 +479,33 @@ class SolarWeatherCard extends HTMLElement {
     const srLabel = sunrise ? formatTime(sunrise, this._config.time_format === '24h') : '--:--';
     const ssLabel = sunset  ? formatTime(sunset,  this._config.time_format === '24h') : '--:--';
 
-    // Radar config
     const radarLat   = safeNum(this._config.radar_latitude);
     const radarLon   = safeNum(this._config.radar_longitude);
     const radarZoom  = parseInt(this._config.radar_zoom) || 7;
     const radarReady = radarLat !== null && radarLon !== null;
 
-    // ── HTML ─────────────────────────────────────────────────────────────────
-    this.shadowRoot.innerHTML = `
-      <style>
-        :host { display: block; }
-        .swc-card {
-          background: var(--ha-card-background, var(--card-background-color, #fff));
-          border-radius: var(--ha-card-border-radius, 12px);
-          border: 0.5px solid var(--divider-color, rgba(0,0,0,0.12));
-          padding: 0; overflow: hidden;
-          font-family: var(--primary-font-family, sans-serif);
-          color: var(--primary-text-color);
-        }
-        .swc-inner { padding: 16px 20px 14px; }
-
-        /* ── Clock ── */
-        .swc-header { display: flex; align-items: flex-start; justify-content: space-between; }
-        .swc-time { font-size: 52px; font-weight: 300; line-height: 1; letter-spacing: -2px; }
-        .swc-date { font-size: 13px; color: var(--secondary-text-color); margin-top: 5px; }
-        .swc-weather-col { text-align: right; }
-        .swc-wx-icon { font-size: 32px; line-height: 1; }
-        .swc-wx-temp { font-size: 24px; font-weight: 300; margin-top: 2px; }
-        .swc-wx-desc { font-size: 11px; color: var(--secondary-text-color); margin-top: 2px; }
-
-        /* ── Divider ── */
-        .swc-divider { height: 1px; background: var(--divider-color, rgba(0,0,0,0.08)); margin: 0 16px; }
-
-        /* ── Forecast ── */
-        .swc-forecast-wrap { padding: 10px 20px 12px; }
-        .swc-fc-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-        .swc-fc-title { font-size: 11px; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; color: var(--secondary-text-color); }
-        .swc-expand-btn { font-size: 11px; cursor: pointer; color: var(--accent-color, #03a9f4); }
-        .swc-day-row { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
-        .swc-day-name { font-size: 12px; width: 32px; flex-shrink: 0; color: var(--secondary-text-color); }
-        .swc-day-icon { width: 18px; flex-shrink: 0; font-size: 14px; text-align: center; }
-        .swc-temp-lo { font-size: 11px; color: var(--secondary-text-color); width: 26px; text-align: right; flex-shrink: 0; }
-        .swc-temp-hi { font-size: 12px; font-weight: 600; width: 26px; flex-shrink: 0; }
-        .swc-temp-track { flex: 1; height: 8px; background: var(--secondary-background-color, rgba(0,0,0,0.06)); border-radius: 4px; position: relative; overflow: hidden; }
-        .swc-temp-fill { height: 8px; border-radius: 4px; position: absolute; }
-
-        /* ── Solar ── */
-        .swc-solar-wrap { padding: 10px 20px 14px; }
-        .swc-solar-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
-        .swc-solar-label { font-size: 11px; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; color: var(--secondary-text-color); }
-        .swc-solar-kw { font-size: 22px; font-weight: 300; }
-        .swc-solar-kw-unit { font-size: 13px; color: var(--secondary-text-color); }
-        .swc-standby { font-size: 12px; color: var(--secondary-text-color); padding: 4px 0 2px; }
-
-        /* Power bar */
-        .swc-pwr-bar { height: 34px; border-radius: 8px; background: var(--secondary-background-color, rgba(0,0,0,0.06)); position: relative; overflow: hidden; }
-        .swc-pwr-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 8px; display: flex; align-items: center; justify-content: flex-end; padding-right: 10px; transition: width 0.4s ease; }
-        .swc-pwr-val { font-size: 11px; font-weight: 600; color: rgba(0,0,0,0.7); white-space: nowrap; }
-        .swc-pwr-forecast { position: absolute; top: 0; bottom: 0; width: 2px; opacity: 0.85; pointer-events: none; }
-
-        /* Stats row */
-        .swc-stat-row { display: flex; gap: 16px; margin-top: 8px; font-size: 12px; }
-        .swc-stat-item { display: flex; align-items: center; gap: 4px; }
-        .swc-stat-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-        .swc-stat-label { color: var(--secondary-text-color); }
-        .swc-stat-val { font-weight: 500; }
-
-        /* Legend */
-        .swc-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
-        .swc-legend-item { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--secondary-text-color); }
-        .swc-legend-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-
-        /* ── Day progress bar ── */
-        .swc-daybar-wrap { padding: 6px 20px 14px; }
-        .swc-daybar-label { font-size: 11px; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; color: var(--secondary-text-color); margin-bottom: 10px; }
-        .swc-daybar-track { position: relative; height: 5px; background: var(--secondary-background-color, rgba(0,0,0,0.08)); border-radius: 3px; margin: 14px 0 16px; }
-        .swc-daybar-fill  { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; }
-        .swc-daybar-sun   { position: absolute; top: 50%; transform: translate(-50%, -50%); font-size: 18px; line-height: 1; pointer-events: none; }
-        .swc-daybar-times { display: flex; justify-content: space-between; font-size: 11px; color: var(--secondary-text-color); }
-
-        /* ── Radar ── */
-        .swc-radar-wrap { padding: 0 20px 14px; }
-        .swc-radar-header { display: flex; align-items: center; justify-content: space-between; background: var(--secondary-background-color, rgba(0,0,0,0.04)); border-radius: 8px; padding: 9px 14px; cursor: pointer; user-select: none; }
-        .swc-radar-title { font-size: 13px; font-weight: 500; }
-        .swc-radar-badge { font-size: 11px; padding: 2px 8px; border-radius: 8px; background: var(--error-color, #f44336); color: #fff; margin-left: 8px; }
-        .swc-radar-chevron { font-size: 14px; color: var(--secondary-text-color); transition: transform 0.2s; }
-        .swc-radar-chevron.open { transform: rotate(90deg); }
-        .swc-radar-note { font-size: 11px; color: var(--secondary-text-color); padding: 14px; text-align: center; background: var(--secondary-background-color, rgba(0,0,0,0.03)); border-radius: 8px; margin-top: 8px; }
-
-        /* Rain pill */
-        .swc-rain-pill { display: inline-block; background: var(--info-color, #2196f3); color: #fff; font-size: 10px; border-radius: 8px; padding: 1px 7px; margin-left: 8px; vertical-align: middle; }
-      </style>
-
-      <ha-card class="swc-card">
+    // ── Dynamic HTML (everything except radar body) ───────────────────────
+    const dyn = this.shadowRoot.getElementById('swc-dyn');
+    if (dyn) {
+      dyn.innerHTML = `
         <div class="swc-inner">
-
-          <!-- Clock / Weather header -->
           <div class="swc-header">
             <div>
               <div class="swc-time">${timeStr}</div>
               <div class="swc-date">
-                ${dateStr}${rainAlert && this._config.show_radar ? `<span class="swc-rain-pill">🌧️ ${round1(precip)} mm/h</span>` : ''}
+                ${dateStr}${rainAlert && this._config.show_radar
+                  ? `<span class="swc-rain-pill">🌧️ ${round1(precip)} mm/h</span>` : ''}
               </div>
             </div>
             ${this._config.show_weather_section ? `
             <div class="swc-weather-col">
-              <div class="swc-wx-icon">${wxIcon}</div>
+              <div class="swc-wx-icon">${weatherIcon(wxState)}</div>
               <div class="swc-wx-temp">${wxTemp !== null ? wxTemp : '--'}${wxUnit}</div>
               <div class="swc-wx-desc">${wxDesc}</div>
             </div>` : ''}
           </div>
-
         </div>
 
-        <!-- Forecast -->
         ${this._config.show_weather_section && this._config.show_forecast_days && fc.length ? `
         <div class="swc-divider"></div>
         <div class="swc-forecast-wrap">
@@ -507,56 +519,51 @@ class SolarWeatherCard extends HTMLElement {
         </div>
         ` : ''}
 
-        <!-- Solar bar -->
         ${this._config.show_solar_section ? `
         <div class="swc-divider"></div>
         <div class="swc-solar-wrap">
-          ${this._renderSolarBar(solar, exportKw, importKw, usage, solarPct, inverter, isStandby, colors)}
+          ${this._renderSolarBar(solar, exportKw, importKw, usage, solarPct, isStandby, colors)}
         </div>
         ` : ''}
 
-        <!-- Day progress -->
         ${this._config.show_solar_arc ? `
         <div class="swc-divider"></div>
-        ${this._renderDayBar(arcPct, srLabel, ssLabel, colors)}
+        ${this._renderDayBar(arcPct, srLabel, ssLabel)}
         ` : ''}
 
-        <!-- Radar -->
         ${this._config.show_radar ? `
         <div class="swc-divider"></div>
         <div class="swc-radar-wrap">
           <div class="swc-radar-header" id="swc-radar-toggle">
-            <span class="swc-radar-title">📡 Weather Radar${rainAlert ? `<span class="swc-radar-badge">${round1(precip)} mm/h</span>` : ''}</span>
+            <span class="swc-radar-title">📡 Weather Radar
+              ${rainAlert ? `<span class="swc-radar-badge">${round1(precip)} mm/h</span>` : ''}
+            </span>
             <span class="swc-radar-chevron ${this._radarExpanded ? 'open' : ''}">›</span>
           </div>
-          ${this._radarExpanded ? `<div id="swc-radar-mount"></div>` : ''}
         </div>
         ` : ''}
+      `;
 
-      </ha-card>
-    `;
+      // Wire events (re-attached each render since dyn innerHTML was replaced)
+      const expandBtn = dyn.querySelector('#swc-expand-btn');
+      if (expandBtn) {
+        expandBtn.addEventListener('click', () => {
+          this._forecastExpanded = !this._forecastExpanded;
+          this._render();
+        });
+      }
 
-    // Wire events
-    const expandBtn = this.shadowRoot.getElementById('swc-expand-btn');
-    if (expandBtn) {
-      expandBtn.addEventListener('click', () => {
-        this._forecastExpanded = !this._forecastExpanded;
-        this._render();
-      });
+      const radarToggle = dyn.querySelector('#swc-radar-toggle');
+      if (radarToggle) {
+        radarToggle.addEventListener('click', () => {
+          this._radarExpanded = !this._radarExpanded;
+          this._render();
+        });
+      }
     }
 
-    const radarToggle = this.shadowRoot.getElementById('swc-radar-toggle');
-    if (radarToggle) {
-      radarToggle.addEventListener('click', () => {
-        this._radarExpanded = !this._radarExpanded;
-        this._render();
-      });
-    }
-
-    const radarMount = this.shadowRoot.getElementById('swc-radar-mount');
-    if (radarMount) {
-      radarMount.appendChild(this._getRadarContent(radarLat, radarLon, radarZoom, radarReady));
-    }
+    // ── Radar stable section (iframe never detached from DOM) ─────────────
+    this._updateRadarStable(radarLat, radarLon, radarZoom, radarReady);
   }
 
   // ── Forecast rows ─────────────────────────────────────────────────────────
@@ -570,52 +577,47 @@ class SolarWeatherCard extends HTMLElement {
       return { hi, lo };
     });
 
-    const hiVals    = temps.map(t => t.hi).filter(v => v !== null);
-    const loVals    = temps.map(t => t.lo).filter(v => v !== null);
-    const scaleMin  = hiVals.length ? Math.min(...loVals) - 2 : 0;
-    const scaleMax  = hiVals.length ? Math.max(...hiVals) + 2 : 30;
+    const hiVals     = temps.map(t => t.hi).filter(v => v !== null);
+    const loVals     = temps.map(t => t.lo).filter(v => v !== null);
+    const scaleMin   = loVals.length ? Math.min(...loVals) - 2 : 0;
+    const scaleMax   = hiVals.length ? Math.max(...hiVals) + 2 : 30;
     const scaleRange = scaleMax - scaleMin || 1;
 
     return forecast.map((day, i) => {
-      const dt  = new Date(day.datetime);
+      const dt       = new Date(day.datetime);
       const { hi, lo } = temps[i];
-      const icon    = weatherIcon(day.condition);
-      const isRain  = ['rainy','pouring','snowy-rainy','lightning-rainy'].includes(day.condition);
+      const isRain   = ['rainy','pouring','snowy-rainy','lightning-rainy'].includes(day.condition);
       const barColor = isRain ? colors.temp_rain : colors.temp_bar;
-
       const leftPct  = lo !== null ? ((lo - scaleMin) / scaleRange) * 100 : 0;
       const widthPct = (hi !== null && lo !== null) ? ((hi - lo) / scaleRange) * 100 : 0;
-
-      const hiStr = hi !== null ? `${Math.round(hi)}°` : '--';
-      const loStr = lo !== null ? `${Math.round(lo)}°` : '--';
 
       return `
         <div class="swc-day-row">
           <span class="swc-day-name">${i === 0 ? 'Today' : dayAbbr(dt)}</span>
-          <span class="swc-day-icon">${icon}</span>
-          <span class="swc-temp-lo">${loStr}</span>
+          <span class="swc-day-icon">${weatherIcon(day.condition)}</span>
+          <span class="swc-temp-lo">${lo !== null ? `${Math.round(lo)}°` : '--'}</span>
           <div class="swc-temp-track">
             ${widthPct > 0 ? `<div class="swc-temp-fill" style="left:${leftPct.toFixed(1)}%;width:${widthPct.toFixed(1)}%;background:${barColor};"></div>` : ''}
           </div>
-          <span class="swc-temp-hi">${hiStr}</span>
+          <span class="swc-temp-hi">${hi !== null ? `${Math.round(hi)}°` : '--'}</span>
         </div>`;
     }).join('');
   }
 
-  // ── Solar bar (single generation bar) ────────────────────────────────────
+  // ── Solar bar ─────────────────────────────────────────────────────────────
 
-  _renderSolarBar(solar, exportKw, importKw, usage, solarPct, inverter, isStandby, colors) {
+  _renderSolarBar(solar, exportKw, importKw, usage, solarPct, isStandby, colors) {
     const showVals  = this._config.show_bar_values;
     const showStats = this._config.show_stats;
-
-    const headerKw  = isStandby ? '—' : round1(solar);
-    const barLabel  = isStandby ? '' : (showVals && solarPct > 12 ? `${round1(solar)} kW` : '');
+    const barLabel  = showVals && solarPct > 12 ? `${round1(solar)} kW` : '';
 
     return `
       <div class="swc-solar-header">
         <span class="swc-solar-label">☀️ Solar</span>
         <span>
-          <span class="swc-solar-kw" style="color:${isStandby ? 'var(--secondary-text-color)' : colors.solar}">${headerKw}</span>
+          <span class="swc-solar-kw" style="color:${isStandby ? 'var(--secondary-text-color)' : colors.solar}">
+            ${isStandby ? '—' : round1(solar)}
+          </span>
           <span class="swc-solar-kw-unit"> kW</span>
         </span>
       </div>
@@ -623,7 +625,7 @@ class SolarWeatherCard extends HTMLElement {
       ${isStandby
         ? `<div class="swc-standby">System in standby</div>`
         : `<div class="swc-pwr-bar">
-             <div class="swc-pwr-fill" style="width:${solarPct.toFixed(1)}%;background:${colors.solar};">
+             <div class="swc-pwr-fill" style="width:${solarPct.toFixed(1)}%;">
                <span class="swc-pwr-val">${barLabel}</span>
              </div>
            </div>`
@@ -633,17 +635,17 @@ class SolarWeatherCard extends HTMLElement {
       <div class="swc-stat-row">
         <div class="swc-stat-item">
           <div class="swc-stat-dot" style="background:${colors.export}"></div>
-          <span class="swc-stat-label">Export</span>
+          <span class="swc-stat-lbl">Export</span>
           <span class="swc-stat-val">&nbsp;${round1(exportKw)} kW</span>
         </div>
         <div class="swc-stat-item">
           <div class="swc-stat-dot" style="background:${colors.import}"></div>
-          <span class="swc-stat-label">Import</span>
+          <span class="swc-stat-lbl">Import</span>
           <span class="swc-stat-val">&nbsp;${round1(importKw)} kW</span>
         </div>
         <div class="swc-stat-item">
           <div class="swc-stat-dot" style="background:${colors.self_usage}"></div>
-          <span class="swc-stat-label">Usage</span>
+          <span class="swc-stat-lbl">Usage</span>
           <span class="swc-stat-val">&nbsp;${round1(Math.max(0, Math.min(solar, usage)) + importKw)} kW</span>
         </div>
       </div>` : ''}
@@ -652,7 +654,7 @@ class SolarWeatherCard extends HTMLElement {
 
   // ── Day progress bar ──────────────────────────────────────────────────────
 
-  _renderDayBar(arcPct, srLabel, ssLabel, colors) {
+  _renderDayBar(arcPct, srLabel, ssLabel) {
     const fillPct = (arcPct * 100).toFixed(1);
     const sunPct  = clamp(arcPct * 100, 2, 98).toFixed(1);
     const isNight = arcPct <= 0 || arcPct >= 1;
@@ -660,7 +662,7 @@ class SolarWeatherCard extends HTMLElement {
       <div class="swc-daybar-wrap">
         <div class="swc-daybar-label">Solar Day</div>
         <div class="swc-daybar-track">
-          <div class="swc-daybar-fill" style="width:${fillPct}%;background:${colors.solar};opacity:0.7;"></div>
+          <div class="swc-daybar-fill" style="width:${fillPct}%;"></div>
           <div class="swc-daybar-sun"  style="left:${sunPct}%">${isNight ? '🌙' : '☀️'}</div>
         </div>
         <div class="swc-daybar-times">
@@ -670,37 +672,64 @@ class SolarWeatherCard extends HTMLElement {
       </div>`;
   }
 
-  // ── Radar (built-in Leaflet map) ──────────────────────────────────────────
-  // Uses srcdoc + sandbox="allow-scripts" (no allow-same-origin) so the iframe
-  // has a null origin/CSP and can freely load Leaflet from unpkg CDN.
+  // ── Radar stable section ──────────────────────────────────────────────────
+  // This container is NEVER cleared by innerHTML — only managed imperatively.
+  // The iframe, once appended, stays in the DOM across all re-renders.
 
-  _getRadarContent(lat, lon, zoom, radarReady) {
+  _updateRadarStable(lat, lon, zoom, radarReady) {
+    const stable = this.shadowRoot.getElementById('swc-radar-stable');
+    if (!stable) return;
+
+    // Hide when radar is off or collapsed
+    if (!this._config.show_radar || !this._radarExpanded) {
+      stable.style.display = 'none';
+      return;
+    }
+
+    stable.style.cssText = 'display:block;';
+
     if (!radarReady) {
-      const note = document.createElement('div');
-      note.className = 'swc-radar-note';
-      note.innerHTML = 'Set <strong>Home latitude</strong> and <strong>Home longitude</strong> in the card editor to enable the radar map.';
-      return note;
+      // No lat/lon configured — show instruction note
+      if (!stable.querySelector('.swc-radar-note')) {
+        stable.innerHTML = `
+          <div class="swc-radar-body-wrap">
+            <div class="swc-radar-note">
+              Set <strong>Home latitude</strong> and <strong>Home longitude</strong>
+              in the card editor to enable the radar map.
+            </div>
+          </div>`;
+      }
+      return;
     }
 
     const key = `${lat}_${lon}_${zoom}`;
+
+    // Create iframe only when config changes (not on every render)
     if (!this._radarIframe || this._radarIframeKey !== key) {
       const iframe         = document.createElement('iframe');
       iframe.srcdoc        = this._buildRadarHtml(lat, lon, zoom);
-      iframe.style.cssText = 'width:100%;height:300px;border:none;display:block;border-radius:8px;margin-top:8px;';
-      iframe.setAttribute('sandbox', 'allow-scripts');  // no allow-same-origin → null CSP → CDN scripts work
+      iframe.style.cssText = 'width:100%;height:300px;border:none;display:block;';
+      iframe.setAttribute('sandbox', 'allow-scripts'); // no allow-same-origin → null CSP → CDN loads freely
       iframe.title         = 'Weather Radar';
       this._radarIframe    = iframe;
       this._radarIframeKey = key;
     }
 
-    const wrapper = document.createElement('div');
-    wrapper.appendChild(this._radarIframe);
-    return wrapper;
+    // Only append if not already in the stable container — this is the key:
+    // if the iframe is already here, we do NOTHING, so it is never reloaded.
+    if (!stable.contains(this._radarIframe)) {
+      stable.innerHTML = ''; // clear any note/placeholder first
+      const wrap = document.createElement('div');
+      wrap.className = 'swc-radar-body-wrap';
+      wrap.style.cssText = 'padding:0 20px 14px;';
+      wrap.appendChild(this._radarIframe);
+      stable.appendChild(wrap);
+    }
   }
 
+  // ── Radar HTML ────────────────────────────────────────────────────────────
+
   _buildRadarHtml(lat, lon, zoom) {
-    // CartoDB Voyager tiles — better contrast for radar overlay than OSM.
-    // Leaflet loaded from unpkg; works because the sandboxed iframe has null origin (no inherited CSP).
     return `<!DOCTYPE html>
 <html>
 <head>
@@ -712,9 +741,9 @@ class SolarWeatherCard extends HTMLElement {
   html, body { height:100%; background:#2a2a2a; }
   #map { height: calc(100% - 24px); }
   #bar {
-    height: 24px; background: rgba(0,0,0,0.75);
-    display: flex; align-items: center; justify-content: center;
-    font: 11px/1 sans-serif; color: #ccc; letter-spacing: 0.04em;
+    height:24px; background:rgba(0,0,0,0.8);
+    display:flex; align-items:center; justify-content:center;
+    font:11px/1 sans-serif; color:#aaa; letter-spacing:0.04em;
   }
 </style>
 </head>
@@ -724,10 +753,7 @@ class SolarWeatherCard extends HTMLElement {
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
 <script>
 (function () {
-  var LAT   = ${lat};
-  var LON   = ${lon};
-  var ZOOM  = ${zoom};
-  var MAX_FRAMES = 6;
+  var LAT = ${lat}, LON = ${lon}, ZOOM = ${zoom}, MAX_FRAMES = 6;
 
   var map = L.map('map', {
     zoomControl: true,
@@ -735,21 +761,18 @@ class SolarWeatherCard extends HTMLElement {
     scrollWheelZoom: true
   }).setView([LAT, LON], ZOOM);
 
-  // CartoDB Voyager base tiles
   L.tileLayer(
     'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',
     { subdomains: ['a','b','c','d'], maxZoom: 19 }
   ).addTo(map);
 
-  // Home marker
   var homeIcon = L.divIcon({
     html: '<div style="font-size:20px;line-height:1;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6))">🏠</div>',
     iconSize: [20, 20], iconAnchor: [10, 17], className: ''
   });
   L.marker([LAT, LON], { icon: homeIcon }).addTo(map);
 
-  // RainViewer animated radar
-  var layers = [], frameTimestamps = [], cur = 0, animTimer = null;
+  var layers = [], frameTimestamps = [], cur = 0;
 
   function showFrame(i) {
     layers.forEach(function (l, j) { l.setOpacity(j === i ? 0.65 : 0); });
@@ -767,7 +790,6 @@ class SolarWeatherCard extends HTMLElement {
       if (!frames.length) { document.getElementById('bar').textContent = 'No radar data'; return; }
 
       frameTimestamps = frames.map(function (f) { return f.time; });
-
       layers = frames.map(function (f) {
         return L.tileLayer(
           'https://tilecache.rainviewer.com' + f.path + '/256/{z}/{x}/{y}/4/1_1.png',
@@ -777,7 +799,7 @@ class SolarWeatherCard extends HTMLElement {
       layers.forEach(function (l) { l.addTo(map); });
 
       showFrame(frames.length - 1);
-      animTimer = setInterval(function () { showFrame((cur + 1) % frames.length); }, 900);
+      setInterval(function () { showFrame((cur + 1) % frames.length); }, 900);
     } catch (e) {
       document.getElementById('bar').textContent = 'Radar unavailable';
     }

@@ -93,6 +93,8 @@ inverter_size: 10
 | `import_entity` | string | — | Grid import sensor (W or kW) |
 | `inverter_size` | number | `10` | Inverter peak capacity in kW (sets bar scale) |
 | `forecast_days` | number | `1` | Default visible forecast days (1–7) |
+| `forecast_always_expanded` | boolean | `false` | Always show all forecast days (no expand/collapse toggle) |
+| `font_scale` | number | `1.5` | Font size multiplier (1.0 = base size, 1.5 = 150%) |
 | `time_format` | `12h` / `24h` | `24h` | Clock display format |
 | `date_format` | string | `D, dd MMM yyyy` | Date display format (see presets below) |
 | `color_palette` | string | `classic-solar` | Colour palette key |
@@ -104,6 +106,7 @@ inverter_size: 10
 | `show_legend` | boolean | `true` | Show bar legend |
 | `show_bar_values` | boolean | `true` | Show kW labels inside bar segments |
 | `show_radar` | boolean | `false` | Enable radar panel |
+| `radar_replaces_forecast` | boolean | `false` | Hide forecast and show radar when rain alert is active |
 | `precipitation_entity` | string | — | Sensor for current precipitation (mm/h); used for rain alert |
 | `radar_rain_threshold` | number | `0.5` | mm/h above which the radar auto-expands |
 | `radar_latitude` | number | — | Home latitude (required for radar map) |
